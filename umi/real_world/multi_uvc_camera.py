@@ -7,6 +7,143 @@ from multiprocessing.managers import SharedMemoryManager
 import numpy as np
 from umi.real_world.uvc_camera import UvcCamera
 from umi.real_world.video_recorder import VideoRecorder
+import torch
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QLabel, QWidget
+)
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QImage, QPixmap
+
+class PointAnnotator(QWidget):
+    point_selected = pyqtSignal(float, float)  # Signal to emit when point is selected
+
+    def __init__(self, first_frame, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Initial Point")
+        self.first_frame = first_frame
+        
+        # Setup UI
+        layout = QVBoxLayout()
+        
+        # Image display
+        self.image_label = QLabel()
+        self.display_image(first_frame)
+        layout.addWidget(self.image_label)
+        
+        # Instructions
+        instruction_label = QLabel("Click on the object to track")
+        layout.addWidget(instruction_label)
+        
+        self.setLayout(layout)
+
+    def display_image(self, image):
+        h, w, ch = image.shape
+        bytes_per_line = ch * w
+        qt_image = QImage(image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qt_image)
+        scaled_pixmap = pixmap.scaled(800, 600, Qt.KeepAspectRatio)
+        self.image_label.setPixmap(scaled_pixmap)
+        
+        # Store scale factors for coordinate conversion
+        self.scale_x = w / scaled_pixmap.width()
+        self.scale_y = h / scaled_pixmap.height()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Convert coordinates back to original image space
+            x = event.pos().x() * self.scale_x
+            y = event.pos().y() * self.scale_y
+            self.point_selected.emit(x, y)
+            self.close()
+
+class SAMProcessor:
+    def __init__(self):
+        # Initialize SAM model
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+        # Initialize SAM2 model
+        from sam2.build_sam import build_sam2_video_predictor
+
+        sam2_checkpoint = "/home/cyan/code/universal_manipulation_interface/umi/real_world/sam_ckpt/sam2.1_hiera_large.pt"
+        model_cfg = "/home/cyan/code/universal_manipulation_interface/umi/real_world/sam2/configs/sam2.1/sam2.1_hiera_l.yaml"
+
+        self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=self.device)
+        
+        # Visualization parameters
+        self.mask_alpha = 0.3
+        self.mask_color = np.array([200, 0, 200])
+
+        self.tracking_point = None  # Single point to store tracking location
+
+    def get_mask_center(self, mask):
+        """Calculate center of mass of the mask"""
+        if mask is None:
+            return None
+        y_indices, x_indices = np.where(mask)
+        if len(x_indices) == 0 or len(y_indices) == 0:
+            return None
+        center_x = np.mean(x_indices)
+        center_y = np.mean(y_indices)
+        return [center_x, center_y]
+
+    def set_point(self, x, y):
+        """Set tracking point"""
+        self.tracking_point = [x, y]
+
+
+    def process_frames(self, frames):
+        """Process frames using current tracking point"""
+        inference_state = self.predictor.init_state()
+        self.predictor.reset_state(inference_state)
+
+        # Process only if we have a tracking point
+        if self.tracking_point is not None:
+            points = np.array([self.tracking_point], dtype=np.float32)
+            labels = np.array([1], np.int32)
+            
+            # Add point and check if successful
+            inference_state, obj_ids, mask_logits = self.predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=0,
+                obj_id=0,
+                points=points,
+                labels=labels
+            )
+            
+            # Check if point was added successfully
+            if len(obj_ids) == 0:
+                print("Failed to add tracking point")
+                return frames
+
+            # Generate masks for all frames
+            video_segments = {}
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
+                inference_state, start_frame_idx=0):
+                mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+                video_segments[out_frame_idx] = mask
+
+            # Process frames and update tracking point
+            processed_frames = frames.copy()
+            last_mask = None
+            for frame_idx, mask in video_segments.items():
+                last_mask = mask
+                h, w = mask.shape[-2:]
+                mask_image = mask.reshape(h, w, 1) * self.mask_color.reshape(1, 1, -1)
+                blended_frame = (1 - self.mask_alpha) * frames[frame_idx] + self.mask_alpha * mask_image
+                processed_frames[frame_idx] = np.clip(blended_frame, 0, 255).astype(np.uint8)
+
+            # Update tracking point using the last frame's mask
+            if last_mask is not None:
+                self.tracking_point = self.get_mask_center(last_mask)
+
+            return processed_frames
+        return frames
 
 class MultiUvcCamera:
     def __init__(self,
@@ -72,6 +209,9 @@ class MultiUvcCamera:
         self.cameras = cameras
         self.shm_manager = shm_manager
 
+        self.sam_processor = SAMProcessor()
+        self.app = QApplication.instance() or QApplication([])
+
     def __enter__(self):
         self.start()
         return self
@@ -115,6 +255,13 @@ class MultiUvcCamera:
         for camera in self.cameras.values():
             camera.join()
 
+    def get_initial_point(self, first_frame):
+        """Show GUI to get initial point"""
+        annotator = PointAnnotator(first_frame)
+        annotator.point_selected.connect(self.sam_processor.set_point)
+        annotator.show()
+        self.app.exec_()
+
     def get(self, k=None, out=None) -> Dict[int, Dict[str, np.ndarray]]:
         """
         Return order T,H,W,C
@@ -128,12 +275,25 @@ class MultiUvcCamera:
         """
         if out is None:
             out = dict()
+
         for i, camera in enumerate(self.cameras.values()):
             this_out = None
             if i in out:
                 this_out = out[i]
             this_out = camera.get(k=k, out=this_out)
+            
+            # If no tracking point, get initial annotation
+            if self.sam_processor.tracking_point is None:
+                self.get_initial_point(this_out['rgb'][0])
+            
+            # Process frames with SAM
+            processed_frames = self.sam_processor.process_frames(
+                frames=this_out['rgb']
+            )
+            this_out['rgb'] = processed_frames
+                
             out[i] = this_out
+            
         return out
 
     def get_vis(self, out=None):

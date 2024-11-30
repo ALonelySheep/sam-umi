@@ -169,10 +169,37 @@ class UvcCamera(mp.Process):
         return self.ready_event.is_set()
 
     def get(self, k=None, out=None):
-        if k is None:
-            return self.ring_buffer.get(out=out)
-        else:
-            return self.ring_buffer.get_last_k(k, out=out)
+        cap = cv2.VideoCapture("/home/cyan/code/UMI_2024/raw_videos/GX010088.MP4")
+        frames = []
+        timestamps = []
+        colors = []
+        
+        # Read k frames or all frames if k is None
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret or (k is not None and frame_count >= k):
+                break
+                
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            timestamp = frame_count / cap.get(cv2.CAP_PROP_FPS)
+            
+            colors.append(frame)
+            timestamps.append(timestamp)
+            frame_count += 1
+            
+        cap.release()
+        
+        return {
+            'color': np.array(colors),
+            'timestamp': np.array(timestamps)
+        }
+        
+    # def get(self, k=None, out=None):
+    #     if k is None:
+    #         return self.ring_buffer.get(out=out)
+    #     else:
+    #         return self.ring_buffer.get_last_k(k, out=out)
     
     def get_vis(self, out=None):
         return self.vis_ring_buffer.get(out=out)
