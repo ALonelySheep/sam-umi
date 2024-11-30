@@ -94,7 +94,7 @@ Downloading in-the-wild cup arrangement dataset (processed).
 
 Multi-GPU training.
 ```console
-(umi)$ accelerate --num_processes <ngpus> train.py --config-name=train_diffusion_unet_timm_umi_workspace task.dataset_path=cup_in_the_wild.zarr.zip
+(umi)$ accelerate launch --num_processes <ngpus> train.py --config-name=train_diffusion_unet_timm_umi_workspace task.dataset_path=./data/cup_in_the_wild.zarr.zip
 ```
 
 ## 🦾 Real-world Deployment
